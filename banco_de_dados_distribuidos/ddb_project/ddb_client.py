@@ -1,357 +1,336 @@
+#!/usr/bin/env python3
 """
 Cliente GUI para Banco de Dados Distribuído
-Interface gráfica usando tkinter
+Interface similar ao cliente de compilação Kotlin
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, ttk
 import socket
 import json
-import threading
-import time
-from datetime import datetime
-
+import hashlib
+import random
 
 class DDBClient:
-    """Cliente para interagir com o DDB"""
-
-    def __init__(self, master):
-        self.master = master
-        self.master.title("Cliente DDB - Banco de Dados Distribuído")
-        self.master.geometry("1000x700")
-
-        # Estado
-        self.connected_node = None
-        self.query_history = []
-
-        self.create_widgets()
-
-    def create_widgets(self):
-        """Cria interface gráfica"""
-
-        # Frame de conexão
-        conn_frame = ttk.LabelFrame(self.master, text="Conexão", padding=10)
-        conn_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Label(conn_frame, text="Host:").grid(row=0, column=0, padx=5)
-        self.host_entry = ttk.Entry(conn_frame, width=20)
-        self.host_entry.insert(0, "127.0.0.1")
-        self.host_entry.grid(row=0, column=1, padx=5)
-
-        ttk.Label(conn_frame, text="Port:").grid(row=0, column=2, padx=5)
-        self.port_entry = ttk.Entry(conn_frame, width=10)
-        self.port_entry.insert(0, "5000")
-        self.port_entry.grid(row=0, column=3, padx=5)
-
-        self.connect_btn = ttk.Button(
-            conn_frame,
-            text="Conectar",
-            command=self.test_connection
-        )
-        self.connect_btn.grid(row=0, column=4, padx=5)
-
-        self.status_label = ttk.Label(conn_frame, text="Desconectado", foreground="red")
-        self.status_label.grid(row=0, column=5, padx=10)
-
-        # Frame de query
-        query_frame = ttk.LabelFrame(self.master, text="Editor de Query SQL", padding=10)
-        query_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        # Área de edição de query
-        ttk.Label(query_frame, text="Digite sua query SQL:").pack(anchor=tk.W)
-
-        self.query_text = scrolledtext.ScrolledText(
-            query_frame,
-            height=8,
-            wrap=tk.WORD,
-            font=("Courier", 11)
-        )
-        self.query_text.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        # Exemplos de queries
-        examples = [
-            "SELECT * FROM users;",
-            "SELECT * FROM users WHERE id = 1;",
-            "INSERT INTO users (name, email) VALUES ('João', 'joao@email.com');",
-            "UPDATE users SET email = 'novo@email.com' WHERE id = 1;",
-            "DELETE FROM users WHERE id = 1;"
+    def __init__(self):
+        self.janela = tk.Tk()
+        self.janela.title("Cliente DDB - Banco de Dados Distribuído")
+        self.janela.geometry("900x750")
+        
+        # Lista de nós disponíveis
+        self.nodes = [
+            {'id': 1, 'host': 'localhost', 'port': 5001},
+            {'id': 2, 'host': 'localhost', 'port': 5002},
+            {'id': 3, 'host': 'localhost', 'port': 5003}
         ]
-        self.query_text.insert("1.0", "-- Exemplos de queries:\n")
-        for ex in examples:
-            self.query_text.insert(tk.END, f"-- {ex}\n")
-        self.query_text.insert(tk.END, "\n-- Digite sua query abaixo:\n")
-
-        # Botões de ação
-        btn_frame = ttk.Frame(query_frame)
-        btn_frame.pack(fill=tk.X, pady=5)
-
-        self.execute_btn = ttk.Button(
-            btn_frame,
-            text="▶ Executar Query",
-            command=self.execute_query,
-            state=tk.DISABLED
-        )
-        self.execute_btn.pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(
-            btn_frame,
-            text="🗑 Limpar",
-            command=self.clear_query
-        ).pack(side=tk.LEFT, padx=5)
-
-        self.query_type_var = tk.StringVar(value="READ")
-        ttk.Radiobutton(
-            btn_frame,
-            text="SELECT (READ)",
-            variable=self.query_type_var,
-            value="READ"
-        ).pack(side=tk.LEFT, padx=10)
-
-        ttk.Radiobutton(
-            btn_frame,
-            text="INSERT/UPDATE/DELETE (WRITE)",
-            variable=self.query_type_var,
-            value="WRITE"
-        ).pack(side=tk.LEFT, padx=10)
-
-        # Frame de resultado
-        result_frame = ttk.LabelFrame(self.master, text="Resultado da Query", padding=10)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.result_text = scrolledtext.ScrolledText(
-            result_frame,
-            height=8,
-            wrap=tk.WORD,
-            font=("Courier", 10),
-            state=tk.DISABLED
-        )
-        self.result_text.pack(fill=tk.BOTH, expand=True)
-
-        # Frame de informações
-        info_frame = ttk.LabelFrame(self.master, text="Informações", padding=10)
-        info_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        self.info_label = ttk.Label(info_frame, text="Aguardando execução de query...")
-        self.info_label.pack(anchor=tk.W)
-
-    def clear_query(self):
-        """Limpa área de query"""
-        self.query_text.delete("1.0", tk.END)
-
-    def update_result(self, text, clear=True):
-        """Atualiza área de resultado"""
-        self.result_text.config(state=tk.NORMAL)
-        if clear:
-            self.result_text.delete("1.0", tk.END)
-        self.result_text.insert(tk.END, text)
-        self.result_text.config(state=tk.DISABLED)
-
-    def test_connection(self):
-        """Testa conexão com um nó"""
-        host = self.host_entry.get()
-        port = int(self.port_entry.get())
-
-        self.update_result("Testando conexão...\n")
-
-        try:
-            # Envia heartbeat
-            message = {
-                'type': 'HEARTBEAT',
-                'node_id': 'client',
-                'timestamp': time.time(),
-                'data': {'host': 'client', 'port': 0}
-            }
-
-            # Calcula checksum
-            import hashlib
-            checksum_data = message.copy()
-            message['checksum'] = hashlib.md5(
-                json.dumps(checksum_data, sort_keys=True).encode()
-            ).hexdigest()
-
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((host, port))
-            sock.send(json.dumps(message).encode())
-
-            response = sock.recv(4096)
-            sock.close()
-
-            if response:
-                self.connected_node = (host, port)
-                self.status_label.config(text="Conectado", foreground="green")
-                self.execute_btn.config(state=tk.NORMAL)
-                self.update_result(f"✓ Conectado ao nó {host}:{port}\n")
-                messagebox.showinfo("Sucesso", f"Conectado ao nó {host}:{port}")
-
-        except Exception as e:
-            self.status_label.config(text="Erro na conexão", foreground="red")
-            self.update_result(f"✗ Erro ao conectar: {e}\n")
-            messagebox.showerror("Erro", f"Não foi possível conectar:\n{e}")
-
-    def execute_query(self):
-        """Executa query no DDB"""
-        if not self.connected_node:
-            messagebox.showwarning("Aviso", "Conecte-se a um nó primeiro!")
-            return
-
-        query = self.query_text.get("1.0", tk.END).strip()
-
-        # Remove comentários
-        query_lines = []
-        for line in query.split('\n'):
-            line = line.strip()
-            if line and not line.startswith('--'):
-                query_lines.append(line)
-
-        query = ' '.join(query_lines)
-
+        
+        self.create_widgets()
+    
+    def calculate_checksum(self, data):
+        """Calcula checksum MD5"""
+        return hashlib.md5(data.encode('utf-8')).hexdigest()
+    
+    def select_node(self):
+        """
+        Seleciona um nó para executar a query (balanceamento de carga)
+        Estratégia: Round-robin aleatório
+        """
+        return random.choice(self.nodes)
+    
+    def enviar_query(self):
+        """Envia query SQL para o DDB"""
+        query = self.txt_query.get("1.0", tk.END).strip()
+        
         if not query:
             messagebox.showwarning("Aviso", "Digite uma query SQL!")
             return
-
-        self.execute_btn.config(state=tk.DISABLED)
-        self.update_result("Executando query...\n")
-
-        # Executa em thread separada
-        threading.Thread(
-            target=self._execute_query_thread,
-            args=(query,),
-            daemon=True
-        ).start()
-
-    def _execute_query_thread(self, query):
-        """Executa query em thread separada"""
+        
+        # Limpa áreas de resultado
+        self.txt_resultado.config(state=tk.NORMAL)
+        self.txt_resultado.delete("1.0", tk.END)
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        
+        # Seleciona nó para executar
+        node = self.select_node()
+        
+        self.log(f"→ Conectando ao Nó {node['id']} ({node['host']}:{node['port']})...")
+        self.log(f"→ Query: {query[:80]}{'...' if len(query) > 80 else ''}\n")
+        
         try:
-            host, port = self.connected_node
-
-            # Cria mensagem
+            # Cria socket e conecta
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((node['host'], node['port']))
+            
+            # Prepara mensagem
+            checksum = self.calculate_checksum(query)
             message = {
                 'type': 'QUERY',
-                'node_id': 'client',
-                'timestamp': time.time(),
-                'data': {
-                    'query': query,
-                    'type': self.query_type_var.get()
-                }
-            }
-
-            # Calcula checksum
-            import hashlib
-            checksum_data = message.copy()
-            message['checksum'] = hashlib.md5(
-                json.dumps(checksum_data, sort_keys=True).encode()
-            ).hexdigest()
-
-            # Envia query
-            start_time = time.time()
-
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(30)
-            sock.connect((host, port))
-            sock.send(json.dumps(message).encode())
-
-            # Recebe resposta
-            data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if len(chunk) < 4096:
-                    break
-
-            sock.close()
-
-            end_time = time.time()
-            elapsed = end_time - start_time
-
-            response = json.loads(data.decode())
-
-            # Processa resultado
-            result_text = f"{'=' * 60}\n"
-            result_text += f"Query executada em: {elapsed:.3f}s\n"
-            result_text += f"Nó que processou: {response['data'].get('node_id', 'Desconhecido')}\n"
-            result_text += f"Status: {response['data']['status']}\n"
-            result_text += f"{'=' * 60}\n\n"
-
-            if response['data']['status'] == 'success':
-                result_data = response['data']['result']
-
-                if 'rows' in result_data:
-                    rows = result_data['rows']
-                    result_text += f"Registros retornados: {len(rows)}\n\n"
-
-                    if rows:
-                        # Formata tabela
-                        if len(rows) > 0:
-                            headers = list(rows[0].keys())
-
-                            # Calcula largura das colunas
-                            widths = {h: len(str(h)) for h in headers}
-                            for row in rows:
-                                for h in headers:
-                                    widths[h] = max(widths[h], len(str(row.get(h, ''))))
-
-                            # Cabeçalho
-                            header_line = " | ".join(
-                                str(h).ljust(widths[h]) for h in headers
-                            )
-                            result_text += header_line + "\n"
-                            result_text += "-" * len(header_line) + "\n"
-
-                            # Linhas
-                            for row in rows[:100]:  # Limita a 100 linhas
-                                line = " | ".join(
-                                    str(row.get(h, '')).ljust(widths[h])
-                                    for h in headers
-                                )
-                                result_text += line + "\n"
-
-                            if len(rows) > 100:
-                                result_text += f"\n... e mais {len(rows) - 100} registros\n"
-                    else:
-                        result_text += "Nenhum registro encontrado.\n"
-
-                elif 'affected_rows' in result_data:
-                    result_text += f"Linhas afetadas: {result_data['affected_rows']}\n"
-                    result_text += "\n✓ Query executada com sucesso!\n"
-                    result_text += "Os dados foram replicados em todos os nós do DDB.\n"
-
-            else:
-                result_text += f"✗ Erro: {response['data'].get('message', 'Erro desconhecido')}\n"
-
-            # Atualiza interface
-            self.master.after(0, self.update_result, result_text)
-            self.master.after(0, self.info_label.config, {
-                'text': f"Última query: {datetime.now().strftime('%H:%M:%S')} | "
-                        f"Tempo: {elapsed:.3f}s | "
-                        f"Nó: {response['data'].get('node_id', '?')}"
-            })
-
-            # Salva histórico
-            self.query_history.append({
                 'query': query,
-                'timestamp': datetime.now().isoformat(),
-                'elapsed': elapsed,
-                'node': response['data'].get('node_id'),
-                'status': response['data']['status']
-            })
-
+                'checksum': checksum
+            }
+            
+            # Envia
+            s.sendall(json.dumps(message).encode('utf-8'))
+            self.log("✓ Query enviada com sucesso")
+            
+            # Recebe resposta
+            self.log("→ Aguardando resposta...\n")
+            resposta_raw = s.recv(8192).decode('utf-8')
+            resposta = json.loads(resposta_raw)
+            
+            s.close()
+            
+            # Processa resposta
+            self.processar_resposta(resposta, node)
+            
+        except socket.timeout:
+            messagebox.showerror("Erro", "Timeout: Nó não respondeu a tempo")
+            self.log("✗ ERRO: Timeout ao aguardar resposta")
+        except ConnectionRefusedError:
+            messagebox.showerror("Erro", f"Não foi possível conectar ao Nó {node['id']}")
+            self.log(f"✗ ERRO: Conexão recusada pelo Nó {node['id']}")
+        except json.JSONDecodeError as e:
+            messagebox.showerror("Erro", "Resposta inválida do servidor")
+            self.log(f"✗ ERRO: Resposta JSON inválida: {e}")
         except Exception as e:
-            error_msg = f"✗ Erro ao executar query:\n{str(e)}\n"
-            self.master.after(0, self.update_result, error_msg)
-            self.master.after(0, messagebox.showerror, "Erro", str(e))
+            messagebox.showerror("Erro de Conexão", f"Erro: {e}")
+            self.log(f"✗ ERRO: {e}")
+    
+    def processar_resposta(self, resposta, node):
+        """Processa e exibe a resposta do servidor"""
+        status = resposta.get('status')
+        
+        if status == 'success':
+            self.log("✓ Query executada com SUCESSO!\n")
+            
+            # Informações do nó
+            node_id = resposta.get('node_id', node['id'])
+            self.log(f"Nó executante: {node_id}")
+            
+            # Se foi query de modificação
+            if 'rows_affected' in resposta:
+                rows_affected = resposta['rows_affected']
+                self.log(f"Linhas afetadas: {rows_affected}")
+                
+                # Informações de replicação
+                if 'replicated' in resposta:
+                    rep = resposta['replicated']
+                    self.log(f"Replicação: {rep['success_count']}/{rep['total_peers']} nós")
+                    
+                    if rep['failed_peers']:
+                        self.log(f"⚠ Falha na replicação: Nós {rep['failed_peers']}")
+                
+                self.txt_resultado.insert(tk.END, f"✓ Operação executada com sucesso!\n")
+                self.txt_resultado.insert(tk.END, f"Linhas afetadas: {rows_affected}\n")
+                self.txt_resultado.insert(tk.END, f"Nó: {node_id}\n")
+            
+            # Se foi query SELECT
+            elif 'data' in resposta:
+                data = resposta['data']
+                row_count = resposta.get('row_count', len(data))
+                
+                self.log(f"Registros retornados: {row_count}\n")
+                
+                if row_count == 0:
+                    self.txt_resultado.insert(tk.END, "Nenhum registro encontrado.\n")
+                else:
+                    # Exibe resultados
+                    self.txt_resultado.insert(tk.END, f"Registros encontrados: {row_count}\n")
+                    self.txt_resultado.insert(tk.END, f"Nó executante: {node_id}\n")
+                    self.txt_resultado.insert(tk.END, "\n" + "="*70 + "\n\n")
+                    
+                    # Formata como tabela
+                    for i, row in enumerate(data, 1):
+                        self.txt_resultado.insert(tk.END, f"Registro {i}:\n")
+                        for key, value in row.items():
+                            self.txt_resultado.insert(tk.END, f"  {key}: {value}\n")
+                        self.txt_resultado.insert(tk.END, "\n")
+        
+        elif status == 'error':
+            error_msg = resposta.get('message', 'Erro desconhecido')
+            self.log(f"✗ ERRO: {error_msg}")
+            
+            self.txt_resultado.insert(tk.END, f"ERRO:\n{error_msg}\n")
+            self.txt_resultado.tag_add("error", "1.0", "end")
+            self.txt_resultado.tag_config("error", foreground="red")
+        
+        self.txt_resultado.config(state=tk.DISABLED)
+        self.txt_log.config(state=tk.DISABLED)
+    
+    def verificar_status(self):
+        """Verifica status de todos os nós"""
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        
+        self.log("Verificando status dos nós...\n")
+        
+        for node in self.nodes:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect((node['host'], node['port']))
+                
+                message = {'type': 'STATUS'}
+                s.sendall(json.dumps(message).encode('utf-8'))
+                
+                resposta = s.recv(4096).decode('utf-8')
+                status = json.loads(resposta)
+                
+                s.close()
+                
+                coord = " [COORDENADOR]" if status.get('is_coordinator') else ""
+                self.log(f"✓ Nó {node['id']}: ATIVO{coord}")
+                self.log(f"  - Queries processadas: {status.get('queries_processed', 0)}")
+                self.log(f"  - Peers: {status.get('peers_count', 0)}\n")
+                
+            except Exception as e:
+                self.log(f"✗ Nó {node['id']}: OFFLINE ou ERRO ({e})\n")
+        
+        self.txt_log.config(state=tk.DISABLED)
+    
+    def log(self, mensagem):
+        """Adiciona mensagem ao log"""
+        self.txt_log.insert(tk.END, mensagem + "\n")
+        self.txt_log.see(tk.END)
+    
+    def inserir_exemplo(self, tipo):
+        """Insere exemplo de query"""
+        exemplos = {
+            'create': """CREATE TABLE IF NOT EXISTS usuarios (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    nome VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE,
+    data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);""",
+            'insert': """INSERT INTO usuarios (nome, email) 
+VALUES ('João Silva', 'joao@email.com');""",
+            'select': """SELECT * FROM usuarios;""",
+            'update': """UPDATE usuarios 
+SET nome = 'João Paulo Silva' 
+WHERE id = 1;""",
+            'delete': """DELETE FROM usuarios WHERE id = 1;"""
+        }
+        
+        self.txt_query.delete("1.0", tk.END)
+        self.txt_query.insert("1.0", exemplos.get(tipo, ''))
+    
+    def create_widgets(self):
+        """Cria interface gráfica"""
+        
+        # Frame superior - Configurações
+        frame_config = tk.Frame(self.janela, bg="#2c3e50", pady=10)
+        frame_config.pack(fill=tk.X)
+        
+        tk.Label(
+            frame_config, 
+            text="🗄️ Cliente de Banco de Dados Distribuído",
+            font=("Arial", 14, "bold"),
+            bg="#2c3e50",
+            fg="white"
+        ).pack()
+        
+        # Frame de exemplos
+        frame_exemplos = tk.Frame(self.janela, pady=10)
+        frame_exemplos.pack(fill=tk.X)
+        
+        tk.Label(frame_exemplos, text="Exemplos rápidos:", font=("Arial", 9)).pack(side=tk.LEFT, padx=10)
+        
+        tk.Button(frame_exemplos, text="CREATE", command=lambda: self.inserir_exemplo('create'), width=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_exemplos, text="INSERT", command=lambda: self.inserir_exemplo('insert'), width=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_exemplos, text="SELECT", command=lambda: self.inserir_exemplo('select'), width=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_exemplos, text="UPDATE", command=lambda: self.inserir_exemplo('update'), width=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_exemplos, text="DELETE", command=lambda: self.inserir_exemplo('delete'), width=8).pack(side=tk.LEFT, padx=2)
+        
+        # Área de Query
+        tk.Label(
+            self.janela, 
+            text="Digite sua query SQL:", 
+            font=("Arial", 10, "bold")
+        ).pack(anchor="w", padx=10, pady=(10, 0))
+        
+        self.txt_query = scrolledtext.ScrolledText(self.janela, height=10, font=("Courier", 10))
+        self.txt_query.pack(padx=10, pady=5, fill=tk.BOTH, expand=False)
+        
+        # Query padrão
+        self.txt_query.insert(tk.INSERT, "SELECT * FROM usuarios;")
+        
+        # Botões de ação
+        frame_buttons = tk.Frame(self.janela, pady=10)
+        frame_buttons.pack()
+        
+        btn_executar = tk.Button(
+            frame_buttons,
+            text="🚀 EXECUTAR QUERY",
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            command=self.enviar_query,
+            width=20,
+            height=2
+        )
+        btn_executar.pack(side=tk.LEFT, padx=5)
+        
+        btn_status = tk.Button(
+            frame_buttons,
+            text="📊 STATUS DOS NÓS",
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            command=self.verificar_status,
+            width=20,
+            height=2
+        )
+        btn_status.pack(side=tk.LEFT, padx=5)
+        
+        # Área de Resultado
+        tk.Label(
+            self.janela,
+            text="Resultado da Query:",
+            font=("Arial", 10, "bold")
+        ).pack(anchor="w", padx=10, pady=(10, 0))
+        
+        self.txt_resultado = scrolledtext.ScrolledText(
+            self.janela,
+            height=10,
+            bg="#f0f0f0",
+            font=("Courier", 9)
+        )
+        self.txt_resultado.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+        self.txt_resultado.config(state=tk.DISABLED)
+        
+        # Área de Log
+        tk.Label(
+            self.janela,
+            text="Log de Comunicação:",
+            font=("Arial", 10, "bold"),
+            fg="#2980b9"
+        ).pack(anchor="w", padx=10, pady=(10, 0))
+        
+        self.txt_log = scrolledtext.ScrolledText(
+            self.janela,
+            height=8,
+            bg="#ecf0f1",
+            font=("Courier", 8)
+        )
+        self.txt_log.pack(padx=10, pady=5, fill=tk.X)
+        self.txt_log.config(state=tk.DISABLED)
+        
+        # Rodapé
+        footer = tk.Label(
+            self.janela,
+            text="Sistema DDB com Replicação Automática | Algoritmo Bully | Propriedades ACID",
+            font=("Arial", 8),
+            fg="#7f8c8d"
+        )
+        footer.pack(pady=5)
+    
+    def run(self):
+        """Inicia a aplicação"""
+        self.janela.mainloop()
 
-        finally:
-            self.master.after(0, self.execute_btn.config, {'state': tk.NORMAL})
 
-
-def main():
-    root = tk.Tk()
-    app = DDBClient(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app = DDBClient()
+    app.run()

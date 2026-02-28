@@ -1,519 +1,538 @@
 #!/usr/bin/env python3
 """
-Distributed Database Node
-Middleware para Banco de Dados Distribuído com MySQL
-VERSÃO CORRIGIDA - Heartbeat com IPs corretos
+Nó do Banco de Dados Distribuído (DDB) - VERSÃO SQLITE
+Sistema baseado em sockets TCP com SQLite backend
+VANTAGEM: Não precisa de MySQL instalado ou permissões de admin
 """
 
 import socket
 import threading
 import json
-import hashlib
 import time
-import mysql.connector
-from datetime import datetime
-from enum import Enum
-import logging
+import sqlite3
+import hashlib
+import sys
 import os
+from datetime import datetime
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('DDB-Node')
-
-
-class MessageType(Enum):
-    HEARTBEAT = "HEARTBEAT"
-    QUERY = "QUERY"
-    REPLICATE = "REPLICATE"
-    ELECTION = "ELECTION"
-    COORDINATOR = "COORDINATOR"
-    ACK = "ACK"
-    PREPARE = "PREPARE"
-    COMMIT = "COMMIT"
-    ABORT = "ABORT"
-    NODE_INFO = "NODE_INFO"
-
-
-class DDBNode:
-
-    def __init__(self, node_id, host, port, db_config):
+class DDBNodeSQLite:
+    def __init__(self, node_id, port, db_path, peers=None):
+        """
+        Inicializa um nó do DDB com SQLite
+        
+        Args:
+            node_id: ID único do nó (inteiro)
+            port: Porta para escutar conexões
+            db_path: Caminho para o arquivo SQLite
+            peers: Lista de tuplas (node_id, host, port) dos outros nós
+        """
         self.node_id = node_id
-        self.host = host  # 0.0.0.0 para bind
         self.port = port
-        self.db_config = db_config
-
-        # IP real para comunicação entre nós (dentro da rede Docker)
-        self.actual_host = '172.20.0.' + str(10 + self.node_id)
-
+        self.host = '0.0.0.0'
+        self.db_path = db_path
+        self.peers = peers if peers else []
+        
+        # Estado do coordenador
         self.is_coordinator = False
         self.coordinator_id = None
-        self.nodes = {}
-        # Registra si mesmo com IP real
-        self.nodes[node_id] = (self.actual_host, 5000, time.time())
-
-        self.db_connection = None
-        self.connect_db()
-
+        
+        # Socket servidor
         self.server_socket = None
         self.running = False
-
+        
+        # Lock para operações críticas
+        self.lock = threading.Lock()
+        
+        # Estatísticas
         self.queries_processed = 0
-        self.queries_log = []
-
-        self.nodes_lock = threading.Lock()
-        self.db_lock = threading.Lock()
-
-    def connect_db(self):
-        """Conecta ao MySQL local com retry"""
-        max_retries = 10
-        retry_delay = 3
-
-        for attempt in range(max_retries):
-            try:
-                self.db_connection = mysql.connector.connect(**self.db_config)
-                logger.info(f"Conectado ao MySQL: {self.db_config['database']}")
-                return
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Tentativa {attempt + 1}/{max_retries} falhou. Aguardando {retry_delay}s... Erro: {e}")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"Erro ao conectar ao MySQL após {max_retries} tentativas: {e}")
-                    raise
-
+        self.last_heartbeat = time.time()
+        
+        # Inicializa banco SQLite
+        self.init_database()
+        
+    def init_database(self):
+        """Inicializa o banco SQLite e cria tabelas"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Cria tabela de exemplo
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS usuarios (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT NOT NULL,
+                    email TEXT UNIQUE,
+                    data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Insere dados iniciais apenas no nó 1
+            if self.node_id == 1:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO usuarios (id, nome, email) VALUES 
+                    (1, 'Admin Sistema', 'admin@ddb.local'),
+                    (2, 'Usuario Teste', 'teste@ddb.local')
+                ''')
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"[Nó {self.node_id}] Banco SQLite inicializado: {self.db_path}")
+            
+        except Exception as e:
+            print(f"[Nó {self.node_id}] ERRO ao inicializar SQLite: {e}")
+            sys.exit(1)
+    
+    def get_connection(self):
+        """Retorna uma nova conexão SQLite (thread-safe)"""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row  # Para retornar dicionários
+        return conn
+    
     def calculate_checksum(self, data):
-        return hashlib.md5(json.dumps(data, sort_keys=True).encode()).hexdigest()
-
-    def verify_checksum(self, message):
-        received_checksum = message.get('checksum')
-        message_copy = message.copy()
-        message_copy.pop('checksum', None)
-        calculated = self.calculate_checksum(message_copy)
-        return received_checksum == calculated
-
-    def create_message(self, msg_type, data):
-        message = {
-            'type': msg_type.value,
-            'node_id': self.node_id,
-            'timestamp': time.time(),
-            'data': data
-        }
-        message['checksum'] = self.calculate_checksum(message)
-        return message
-
+        """Calcula checksum MD5 dos dados"""
+        return hashlib.md5(data.encode('utf-8')).hexdigest()
+    
+    def verify_checksum(self, data, checksum):
+        """Verifica integridade dos dados"""
+        return self.calculate_checksum(data) == checksum
+    
     def start(self):
+        """Inicia o servidor do nó"""
         self.running = True
+        
+        # Cria socket servidor
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(10)
-
-        logger.info(f"Nó {self.node_id} iniciado em {self.host}:{self.port} (IP real: {self.actual_host})")
-
-        threading.Thread(target=self.heartbeat_sender, daemon=True).start()
-        threading.Thread(target=self.heartbeat_monitor, daemon=True).start()
-
-        def delayed_election():
-            time.sleep(10)
-            self.start_election()
-
-        threading.Thread(target=delayed_election, daemon=True).start()
-
+        self.server_socket.listen(5)
+        
+        print(f"\n{'='*60}")
+        print(f"[Nó {self.node_id}] DDB Node SQLite iniciado na porta {self.port}")
+        print(f"[Nó {self.node_id}] Database: {self.db_path}")
+        print(f"{'='*60}\n")
+        
+        # Thread para aceitar conexões
+        accept_thread = threading.Thread(target=self.accept_connections, daemon=True)
+        accept_thread.start()
+        
+        # Thread para heartbeat
+        heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+        
+        # Inicia eleição de coordenador
+        time.sleep(2)  # Aguarda outros nós iniciarem
+        self.start_election()
+        
+        # Mantém programa rodando
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print(f"\n[Nó {self.node_id}] Encerrando...")
+            self.stop()
+    
+    def accept_connections(self):
+        """Loop para aceitar conexões de clientes e outros nós"""
         while self.running:
             try:
                 client_socket, address = self.server_socket.accept()
-                threading.Thread(
+                print(f"[Nó {self.node_id}] Conexão recebida de {address}")
+                
+                # Thread para processar requisição
+                client_thread = threading.Thread(
                     target=self.handle_client,
                     args=(client_socket, address),
                     daemon=True
-                ).start()
+                )
+                client_thread.start()
+                
             except Exception as e:
                 if self.running:
-                    logger.error(f"Erro ao aceitar conexão: {e}")
-
+                    print(f"[Nó {self.node_id}] Erro ao aceitar conexão: {e}")
+    
     def handle_client(self, client_socket, address):
+        """Processa requisição de um cliente ou outro nó"""
         try:
-            data = b""
-            while True:
-                chunk = client_socket.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if len(chunk) < 4096:
-                    break
-
+            # Recebe dados
+            data = client_socket.recv(8192).decode('utf-8')
+            
             if not data:
                 return
-
-            message = json.loads(data.decode())
-
-            if not self.verify_checksum(message):
-                logger.warning("Checksum inválido")
-                response = self.create_message(MessageType.ACK, {
-                    'status': 'error',
-                    'message': 'Checksum inválido'
-                })
-                client_socket.send(json.dumps(response).encode())
-                return
-
-            response = self.process_message(message)
-            client_socket.send(json.dumps(response).encode())
-
+            
+            # Parse da mensagem JSON
+            message = json.loads(data)
+            msg_type = message.get('type')
+            
+            print(f"\n[Nó {self.node_id}] Mensagem recebida: {msg_type}")
+            
+            # Processa diferentes tipos de mensagem
+            if msg_type == 'QUERY':
+                response = self.handle_query(message)
+            elif msg_type == 'REPLICATE':
+                response = self.handle_replication(message)
+            elif msg_type == 'ELECTION':
+                response = self.handle_election(message)
+            elif msg_type == 'COORDINATOR':
+                response = self.handle_coordinator_announcement(message)
+            elif msg_type == 'HEARTBEAT':
+                response = self.handle_heartbeat(message)
+            elif msg_type == 'STATUS':
+                response = self.get_status()
+            else:
+                response = {'status': 'error', 'message': 'Tipo de mensagem desconhecido'}
+            
+            # Envia resposta
+            response_data = json.dumps(response)
+            client_socket.sendall(response_data.encode('utf-8'))
+            
+        except json.JSONDecodeError as e:
+            print(f"[Nó {self.node_id}] Erro ao decodificar JSON: {e}")
+            error_response = json.dumps({'status': 'error', 'message': 'JSON inválido'})
+            client_socket.sendall(error_response.encode('utf-8'))
         except Exception as e:
-            logger.error(f"Erro ao processar mensagem: {e}")
+            print(f"[Nó {self.node_id}] Erro ao processar requisição: {e}")
+            error_response = json.dumps({'status': 'error', 'message': str(e)})
+            client_socket.sendall(error_response.encode('utf-8'))
         finally:
             client_socket.close()
-
-    def process_message(self, message):
-        msg_type = MessageType(message['type'])
-        sender_id = message['node_id']
-        data = message['data']
-
-        logger.info(f"Recebido {msg_type.value} de {sender_id}")
-
-        if msg_type == MessageType.HEARTBEAT:
-            return self.handle_heartbeat(sender_id, data)
-        elif msg_type == MessageType.QUERY:
-            return self.handle_query(data)
-        elif msg_type == MessageType.REPLICATE:
-            return self.handle_replicate(data)
-        elif msg_type == MessageType.ELECTION:
-            return self.handle_election(sender_id)
-        elif msg_type == MessageType.COORDINATOR:
-            return self.handle_coordinator_announcement(sender_id)
-        elif msg_type == MessageType.NODE_INFO:
-            return self.handle_node_info(sender_id, data)
-
-        return self.create_message(MessageType.ACK, {'status': 'unknown_type'})
-
-    def handle_heartbeat(self, sender_id, data):
-        with self.nodes_lock:
-            if sender_id not in self.nodes:
-                self.nodes[sender_id] = (data['host'], data['port'], time.time())
-                logger.info(f"Novo nó descoberto via HEARTBEAT: {sender_id}")
-            else:
-                host, port, _ = self.nodes[sender_id]
-                self.nodes[sender_id] = (host, port, time.time())
-
-        return self.create_message(MessageType.ACK, {'status': 'ok'})
-
-    def handle_query(self, data):
-        query = data['query']
-        query_type = data.get('type', 'READ')
-
-        logger.info(f"Executando query [{query_type}]: {query[:50]}...")
-
+    
+    def handle_query(self, message):
+        """Processa uma query SQL (garantindo ACID)"""
+        query = message.get('query', '')
+        checksum = message.get('checksum', '')
+        
+        # Verifica integridade
+        if not self.verify_checksum(query, checksum):
+            return {
+                'status': 'error',
+                'message': 'Checksum inválido - dados corrompidos'
+            }
+        
+        print(f"[Nó {self.node_id}] Executando query: {query[:100]}...")
+        
         try:
-            with self.db_lock:
-                cursor = self.db_connection.cursor(dictionary=True)
-                cursor.execute(query)
-
-                if query_type == 'WRITE':
-                    self.db_connection.commit()
-                    result = {'affected_rows': cursor.rowcount}
-                    self.broadcast_replicate(query)
-                else:
-                    rows = cursor.fetchall()
-                    for row in rows:
-                        for key, value in row.items():
-                            if isinstance(value, datetime):
-                                row[key] = value.isoformat()
-                    result = {'rows': rows}
-
-                cursor.close()
-
-                self.queries_processed += 1
-                self.queries_log.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'query': query,
-                    'type': query_type,
-                    'node': self.node_id
-                })
-
-                return self.create_message(MessageType.ACK, {
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Inicia transação (ACID)
+            conn.execute("BEGIN TRANSACTION")
+            
+            # Executa query
+            cursor.execute(query)
+            
+            # Verifica se é query de modificação
+            is_modification = query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE'))
+            
+            if is_modification:
+                # Commit da transação local
+                conn.commit()
+                rows_affected = cursor.rowcount
+                
+                # Replica para outros nós (broadcast)
+                replication_result = self.replicate_to_peers(query)
+                
+                result = {
                     'status': 'success',
-                    'result': result,
+                    'message': f'Query executada com sucesso no nó {self.node_id}',
+                    'rows_affected': rows_affected,
+                    'node_id': self.node_id,
+                    'replicated': replication_result
+                }
+            else:
+                # Query de leitura (SELECT)
+                rows = [dict(row) for row in cursor.fetchall()]
+                result = {
+                    'status': 'success',
+                    'data': rows,
+                    'row_count': len(rows),
                     'node_id': self.node_id
-                })
-
+                }
+            
+            cursor.close()
+            conn.close()
+            self.queries_processed += 1
+            
+            return result
+            
+        except sqlite3.Error as err:
+            # Rollback em caso de erro (ACID)
+            if 'conn' in locals():
+                conn.rollback()
+                conn.close()
+            print(f"[Nó {self.node_id}] Erro SQLite: {err}")
+            return {
+                'status': 'error',
+                'message': f'Erro SQLite: {err}',
+                'node_id': self.node_id
+            }
         except Exception as e:
-            logger.error(f"Erro ao executar query: {e}")
-            return self.create_message(MessageType.ACK, {
+            if 'conn' in locals():
+                conn.rollback()
+                conn.close()
+            print(f"[Nó {self.node_id}] Erro: {e}")
+            return {
                 'status': 'error',
                 'message': str(e),
                 'node_id': self.node_id
-            })
-
-    def handle_replicate(self, data):
-        query = data['query']
-        logger.info(f"Replicando query: {query[:50]}...")
-
+            }
+    
+    def replicate_to_peers(self, query):
+        """Replica uma query para todos os outros nós (broadcast)"""
+        print(f"[Nó {self.node_id}] Replicando para {len(self.peers)} peers...")
+        
+        success_count = 0
+        failed_peers = []
+        
+        for peer_id, peer_host, peer_port in self.peers:
+            try:
+                peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer_socket.settimeout(5)
+                peer_socket.connect((peer_host, peer_port))
+                
+                checksum = self.calculate_checksum(query)
+                message = {
+                    'type': 'REPLICATE',
+                    'query': query,
+                    'checksum': checksum,
+                    'origin_node': self.node_id
+                }
+                
+                peer_socket.sendall(json.dumps(message).encode('utf-8'))
+                response = peer_socket.recv(4096).decode('utf-8')
+                response_data = json.loads(response)
+                
+                if response_data.get('status') == 'success':
+                    success_count += 1
+                    print(f"[Nó {self.node_id}] Replicação OK para nó {peer_id}")
+                else:
+                    failed_peers.append(peer_id)
+                
+                peer_socket.close()
+                
+            except Exception as e:
+                print(f"[Nó {self.node_id}] Erro ao replicar para nó {peer_id}: {e}")
+                failed_peers.append(peer_id)
+        
+        return {
+            'success_count': success_count,
+            'total_peers': len(self.peers),
+            'failed_peers': failed_peers
+        }
+    
+    def handle_replication(self, message):
+        """Recebe e executa uma query replicada de outro nó"""
+        query = message.get('query', '')
+        checksum = message.get('checksum', '')
+        origin_node = message.get('origin_node')
+        
+        print(f"[Nó {self.node_id}] Replicação recebida do nó {origin_node}")
+        
+        if not self.verify_checksum(query, checksum):
+            return {'status': 'error', 'message': 'Checksum inválido na replicação'}
+        
         try:
-            with self.db_lock:
-                cursor = self.db_connection.cursor()
-                cursor.execute(query)
-                self.db_connection.commit()
-                cursor.close()
-
-            logger.info("Replicação concluída com sucesso!")
-            return self.create_message(MessageType.ACK, {'status': 'replicated'})
-
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            conn.execute("BEGIN TRANSACTION")
+            cursor.execute(query)
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            print(f"[Nó {self.node_id}] Replicação executada com sucesso")
+            
+            return {
+                'status': 'success',
+                'message': 'Replicação executada',
+                'node_id': self.node_id
+            }
         except Exception as e:
-            logger.error(f"Erro na replicação: {e}")
-            return self.create_message(MessageType.ACK, {
-                'status': 'error',
-                'message': str(e)
-            })
-
-    def broadcast_replicate(self, query):
-        logger.info(f"Iniciando broadcast de replicação para query: {query[:50]}...")
-
-        message = self.create_message(MessageType.REPLICATE, {'query': query})
-
-        with self.nodes_lock:
-            nodes_copy = list(self.nodes.items())
-
-        logger.info(f"Enviando replicação para {len(nodes_copy)-1} nós")
-
-        for node_id, (host, port, _) in nodes_copy:
-            if node_id == self.node_id:
-                continue
-
-            logger.info(f"Enviando replicação para nó {node_id} ({host}:{port})")
-
-            threading.Thread(
-                target=self.send_message,
-                args=(host, port, message),
-                daemon=True
-            ).start()
-
-    def send_message(self, host, port, message):
-        try:
-            logger.info(f"Conectando em {host}:{port}...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((host, port))
-            sock.send(json.dumps(message).encode())
-
-            response = sock.recv(4096)
-            sock.close()
-
-            result = json.loads(response.decode())
-            logger.info(f"Resposta de {host}:{port}: {result['data']['status']}")
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Erro ao enviar para {host}:{port} - {e}")
-            return None
-
-    def heartbeat_sender(self):
-        while self.running:
-            message = self.create_message(MessageType.HEARTBEAT, {
-                'host': self.actual_host,  # USA IP REAL!
-                'port': 5000
-            })
-
-            with self.nodes_lock:
-                nodes_copy = list(self.nodes.items())
-
-            for node_id, (host, port, _) in nodes_copy:
-                if node_id == self.node_id:
-                    continue
-
-                threading.Thread(
-                    target=self.send_message,
-                    args=(host, port, message),
-                    daemon=True
-                ).start()
-
-            time.sleep(5)
-
-    def heartbeat_monitor(self):
-        """Monitora nós inativos"""
-        while self.running:
-            time.sleep(10)
-            current_time = time.time()
-
-            dead_nodes = []
-            coordinator_failed = False
-
-            with self.nodes_lock:
-                for node_id, (host, port, last_seen) in self.nodes.items():
-                    if node_id == self.node_id:
-                        continue
-
-                    if current_time - last_seen > 15:
-                        dead_nodes.append(node_id)
-                        if node_id == self.coordinator_id:
-                            coordinator_failed = True
-
-            # FORA DO LOCK - remove nós mortos
-            if dead_nodes:
-                with self.nodes_lock:
-                    for node_id in dead_nodes:
-                        if node_id in self.nodes:
-                            logger.warning(f"Nó {node_id} está inativo - removendo")
-                            del self.nodes[node_id]
-
-            if coordinator_failed:
-                logger.warning("Coordenador falhou - iniciando eleição")
-                self.start_election()
-
+            if 'conn' in locals():
+                conn.rollback()
+                conn.close()
+            print(f"[Nó {self.node_id}] Erro na replicação: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
     def start_election(self):
         """Inicia processo de eleição (Algoritmo Bully)"""
-        try:
-            logger.info(f"=== INICIANDO ELEIÇÃO === Nó {self.node_id}")
-
-            # Pega lista de nós uma vez só
-            with self.nodes_lock:
-                higher_nodes = [nid for nid in self.nodes.keys() if nid > self.node_id]
-                nodes_copy = dict(self.nodes)  # Copia para não precisar de lock depois
-
-            logger.info(f"Nós com ID maior que {self.node_id}: {higher_nodes}")
-
-            if not higher_nodes:
-                logger.info(f"Nenhum nó maior - Nó {self.node_id} se tornará coordenador")
-                self.become_coordinator()
-                return
-
-            logger.info(f"Enviando ELECTION para {len(higher_nodes)} nós")
-            message = self.create_message(MessageType.ELECTION, {})
-            responses = 0
-
-            for node_id in higher_nodes:
-                if node_id not in nodes_copy:
-                    continue
-
-                host, port, _ = nodes_copy[node_id]
-                logger.info(f"Enviando ELECTION para nó {node_id}")
-                response = self.send_message(host, port, message)
-
+        print(f"\n[Nó {self.node_id}] Iniciando eleição...")
+        
+        higher_nodes = [peer for peer in self.peers if peer[0] > self.node_id]
+        
+        if not higher_nodes:
+            self.become_coordinator()
+            return
+        
+        responses = 0
+        for peer_id, peer_host, peer_port in higher_nodes:
+            try:
+                peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer_socket.settimeout(2)
+                peer_socket.connect((peer_host, peer_port))
+                
+                message = {'type': 'ELECTION', 'from_node': self.node_id}
+                peer_socket.sendall(json.dumps(message).encode('utf-8'))
+                response = peer_socket.recv(1024).decode('utf-8')
+                
                 if response:
                     responses += 1
-                    logger.info(f"✓ Nó {node_id} respondeu")
-                else:
-                    logger.warning(f"✗ Nó {node_id} NÃO respondeu")
-
-            logger.info(f"Total de respostas: {responses}/{len(higher_nodes)}")
-
-            if responses == 0:
-                logger.info(f"Nenhuma resposta - Nó {self.node_id} se tornará coordenador")
-                self.become_coordinator()
-            else:
-                logger.info(f"Aguardando coordenador...")
-
-        except Exception as e:
-            logger.error(f"ERRO na eleição: {e}", exc_info=True)
+                
+                peer_socket.close()
+            except:
+                pass
+        
+        if responses == 0:
             self.become_coordinator()
-
+    
+    def handle_election(self, message):
+        """Responde a uma mensagem de eleição"""
+        from_node = message.get('from_node')
+        print(f"[Nó {self.node_id}] Eleição recebida do nó {from_node}")
+        
+        threading.Thread(target=self.start_election, daemon=True).start()
+        return {'status': 'ok', 'node_id': self.node_id}
+    
     def become_coordinator(self):
-        self.is_coordinator = True
-        self.coordinator_id = self.node_id
-        logger.info(f"Nó {self.node_id} é o novo COORDENADOR")
-
-        message = self.create_message(MessageType.COORDINATOR, {})
-
-        with self.nodes_lock:
-            nodes_copy = list(self.nodes.items())
-
-        for node_id, (host, port, _) in nodes_copy:
-            if node_id == self.node_id:
-                continue
-            self.send_message(host, port, message)
-
-    def handle_election(self, sender_id):
-        if sender_id < self.node_id:
-            threading.Thread(target=self.start_election, daemon=True).start()
-
-        return self.create_message(MessageType.ACK, {'status': 'ok'})
-
-    def handle_coordinator_announcement(self, sender_id):
-        self.coordinator_id = sender_id
-        self.is_coordinator = False
-        logger.info(f"Novo coordenador: {sender_id}")
-
-        return self.create_message(MessageType.ACK, {'status': 'ok'})
-
-    def handle_node_info(self, sender_id, data):
-        with self.nodes_lock:
-            if sender_id not in self.nodes:
-                self.nodes[sender_id] = (data['host'], data['port'], time.time())
-                logger.info(f"Novo nó registrado via NODE_INFO: {sender_id}")
-            else:
-                self.nodes[sender_id] = (data['host'], data['port'], time.time())
-                logger.info(f"Nó {sender_id} atualizado via NODE_INFO")
-
-        return self.create_message(MessageType.ACK, {
-            'status': 'ok',
-            'nodes': {
-                str(nid): {'host': h, 'port': p}
-                for nid, (h, p, _) in self.nodes.items()
-            }
-        })
-
-    def register_with_node(self, known_host, known_port):
-        logger.info(f"Registrando com nó em {known_host}:{known_port}...")
-
-        message = self.create_message(MessageType.NODE_INFO, {
-            'host': self.actual_host,  # USA IP REAL!
-            'port': 5000
-        })
-
-        response = self.send_message(known_host, known_port, message)
-
-        if response and response['data'].get('nodes'):
-            with self.nodes_lock:
-                for node_id_str, info in response['data']['nodes'].items():
-                    node_id = int(node_id_str)
-                    if node_id not in self.nodes:
-                        self.nodes[node_id] = (info['host'], info['port'], time.time())
-                        logger.info(f"Descoberto nó {node_id} via NODE_INFO")
-
-            logger.info(f"Registro completo! Total de {len(self.nodes)} nós conhecidos")
-        else:
-            logger.warning("Falha ao registrar")
-
+        """Este nó se torna o coordenador"""
+        with self.lock:
+            self.is_coordinator = True
+            self.coordinator_id = self.node_id
+        
+        print(f"\n{'*'*60}")
+        print(f"[Nó {self.node_id}] AGORA SOU O COORDENADOR!")
+        print(f"{'*'*60}\n")
+        
+        self.announce_coordinator()
+    
+    def announce_coordinator(self):
+        """Anuncia que este nó é o novo coordenador"""
+        for peer_id, peer_host, peer_port in self.peers:
+            try:
+                peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer_socket.settimeout(2)
+                peer_socket.connect((peer_host, peer_port))
+                
+                message = {'type': 'COORDINATOR', 'coordinator_id': self.node_id}
+                peer_socket.sendall(json.dumps(message).encode('utf-8'))
+                peer_socket.close()
+            except:
+                pass
+    
+    def handle_coordinator_announcement(self, message):
+        """Recebe anúncio de novo coordenador"""
+        coordinator_id = message.get('coordinator_id')
+        
+        with self.lock:
+            self.coordinator_id = coordinator_id
+            self.is_coordinator = False
+        
+        print(f"[Nó {self.node_id}] Novo coordenador: Nó {coordinator_id}")
+        return {'status': 'ok'}
+    
+    def heartbeat_loop(self):
+        """Envia heartbeat periodicamente"""
+        while self.running:
+            time.sleep(5)
+            self.last_heartbeat = time.time()
+            
+            status = "COORDENADOR" if self.is_coordinator else "ATIVO"
+            print(f"[Nó {self.node_id}] Heartbeat - Status: {status} - Queries: {self.queries_processed}")
+    
+    def handle_heartbeat(self, message):
+        """Responde a um heartbeat"""
+        return {
+            'status': 'alive',
+            'node_id': self.node_id,
+            'is_coordinator': self.is_coordinator,
+            'timestamp': time.time()
+        }
+    
+    def get_status(self):
+        """Retorna status detalhado do nó"""
+        return {
+            'node_id': self.node_id,
+            'port': self.port,
+            'is_coordinator': self.is_coordinator,
+            'coordinator_id': self.coordinator_id,
+            'queries_processed': self.queries_processed,
+            'peers_count': len(self.peers),
+            'uptime': time.time() - self.last_heartbeat,
+            'database': 'SQLite',
+            'db_file': self.db_path
+        }
+    
     def stop(self):
+        """Para o servidor"""
         self.running = False
         if self.server_socket:
             self.server_socket.close()
-        if self.db_connection:
-            self.db_connection.close()
-        logger.info("Nó finalizado")
 
 
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 4:
-        print("Uso: python ddb_node.py <node_id> <port> <db_name> [known_host:known_port]")
+def main():
+    """Função principal para iniciar um nó"""
+    if len(sys.argv) < 2:
+        print("Uso: python ddb_node_sqlite.py <node_id>")
+        print("Exemplo: python ddb_node_sqlite.py 1")
         sys.exit(1)
-
+    
     node_id = int(sys.argv[1])
-    port = int(sys.argv[2])
-    db_name = sys.argv[3]
-
-    mysql_host = os.environ.get('DB_HOST', f'mysql{node_id}')
-
-    db_config = {
-        'host': mysql_host,
-        'user': 'ddb_user',
-        'password': 'ddb_password',
-        'database': db_name
+    
+    # Diretório para os bancos SQLite
+    db_dir = os.path.expanduser("~/ddb_databases")
+    os.makedirs(db_dir, exist_ok=True)
+    
+    # Configuração dos nós
+    nodes_config = {
+        1: {
+            'port': 5001,
+            'db_path': os.path.join(db_dir, 'ddb_node1.db')
+        },
+        2: {
+            'port': 5002,
+            'db_path': os.path.join(db_dir, 'ddb_node2.db')
+        },
+        3: {
+            'port': 5003,
+            'db_path': os.path.join(db_dir, 'ddb_node3.db')
+        }
     }
+    
+    if node_id not in nodes_config:
+        print(f"Erro: Configuração não encontrada para nó {node_id}")
+        sys.exit(1)
+    
+    config = nodes_config[node_id]
+    
+    # Lista de peers - CONFIGURADO PARA SUAS MÁQUINAS
+    if node_id == 1:
+        peers = [
+            (2, '10.16.0.109', 5002),   # Máquina 2
+            (3, '10.16.0.254', 5003)   # Máquina 3
+        ]
+    elif node_id == 2:
+        peers = [
+            (1, '10.16.1.233', 5001),   # Máquina 1
+            (3, '110.16.0.254', 5003)   # Máquina 3
+        ]
+    elif node_id == 3:
+        peers = [
+            (1, '10.16.1.233', 5001),   # Máquina 1
+            (2, '10.16.0.109', 5002)    # Máquina 2
+        ]
+    else:
+        peers = []
+    
+    # Cria e inicia o nó
+    node = DDBNodeSQLite(
+        node_id=node_id,
+        port=config['port'],
+        db_path=config['db_path'],
+        peers=peers
+    )
+    
+    node.start()
 
-    node = DDBNode(node_id, '0.0.0.0', port, db_config)
 
-    if len(sys.argv) >= 5:
-        known = sys.argv[4].split(':')
-        node.register_with_node(known[0], int(known[1]))
-
-    try:
-        node.start()
-    except KeyboardInterrupt:
-        logger.info("Encerrando...")
-        node.stop()
+if __name__ == '__main__':
+    main()
